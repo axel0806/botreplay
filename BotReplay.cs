@@ -14,7 +14,7 @@ namespace BotReplay;
 public class BotReplayPlugin : BasePlugin
 {
     public override string ModuleName => "BotReplay";
-    public override string ModuleVersion => "1.3.0";
+    public override string ModuleVersion => "1.4.0";
     public override string ModuleAuthor => "local";
     public override string ModuleDescription => "Record your movement and replay it with an enemy bot in MatchZy practice.";
 
@@ -49,6 +49,7 @@ public class BotReplayPlugin : BasePlugin
         RegisterListener<Listeners.OnMapStart>(_ => Reset());
         RegisterListener<Listeners.OnMapEnd>(Reset);
         RegisterEventHandler<EventGrenadeThrown>(OnGrenadeThrown);
+        RegisterEventHandler<EventPlayerDeath>(OnPlayerDeath);
         AddCommand("css_botreplay_status", "Show bot replay readiness", (_, cmd) =>
         {
             try { cmd.ReplyToCommand($"[BotReplay] MatchZy practice: {InPractice()}; native bridge: {BotController.RecordedTickCount(0) >= 0}; recording: {_recording.Count}; playing: {_playing.Count}; saved tracks: {_tracks.Count}; playback: {_lastPlaybackStatus}."); }
@@ -265,6 +266,28 @@ public class BotReplayPlugin : BasePlugin
         return HookResult.Continue;
     }
 
+    private HookResult OnPlayerDeath(EventPlayerDeath e, GameEventInfo info)
+    {
+        var victim = e.Userid;
+        if (victim is not { IsValid: true, IsBot: true } || victim.Slot != _ownedSlot ||
+            victim.Handle != _ownedHandle || victim.UserId != _ownedUserId || !_playing.Contains(victim.Slot))
+            return HookResult.Continue;
+
+        // Stop input immediately. Disconnect on the next frame, after the death event
+        // has finished, and only if the slot still belongs to this replay bot.
+        var slot = victim.Slot; var handle = victim.Handle; var userId = victim.UserId;
+        BotController.StopReplay(slot);
+        _playing.Remove(slot);
+        _lastPlaybackStatus = "Replay ended because the bot died";
+        Server.NextFrame(() =>
+        {
+            var bot = OwnedBot();
+            if (bot != null && bot.Slot == slot && bot.Handle == handle && bot.UserId == userId)
+                RemoveOwnedBot();
+        });
+        return HookResult.Continue;
+    }
+
     private CCSPlayerController? OwnedBot()
     {
         var bot = _ownedSlot < 0 ? null : Utilities.GetPlayerFromSlot(_ownedSlot);
@@ -303,8 +326,13 @@ public class BotReplayPlugin : BasePlugin
         {
             if (!InPractice()) { StopAll(); UpdateSpawn(); return; }
             UpdateSpawn();
-            if (_playing.Count > 0 && (_ownedSlot < 0 || OwnedBot() == null || !BotController.IsReplaying(_ownedSlot)))
-                StopPlayback();
+            if (_playing.Count > 0)
+            {
+                var bot = OwnedBot();
+                if (bot == null || bot.PlayerPawn is not { IsValid: true, Value.IsValid: true } ||
+                    bot.PlayerPawn.Value!.LifeState != 0 || !BotController.IsReplaying(_ownedSlot))
+                    StopPlayback();
+            }
             if (_recording.Count > 0)
             {
                 var source = Utilities.GetPlayerFromSlot(_recording[0]);
