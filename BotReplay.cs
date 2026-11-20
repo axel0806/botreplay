@@ -14,7 +14,7 @@ namespace BotReplay;
 public class BotReplayPlugin : BasePlugin
 {
     public override string ModuleName => "BotReplay";
-    public override string ModuleVersion => "1.2.0";
+    public override string ModuleVersion => "1.3.0";
     public override string ModuleAuthor => "local";
     public override string ModuleDescription => "Record your movement and replay it with an enemy bot in MatchZy practice.";
 
@@ -23,9 +23,10 @@ public class BotReplayPlugin : BasePlugin
     private readonly HashSet<int> _playing = new();
     private List<Track> _tracks = new();
     private string? _map;
+    private string? _recordingMap;
     private ulong _recordingSteamId;
     private nint _recordingPawn;
-    private Dictionary<int, nint>? _beforeSpawn;
+    private HashSet<int>? _beforeSpawn;
     private int _spawnTeam;
     private int _spawnTicks;
     private int _requesterSlot;
@@ -36,6 +37,7 @@ public class BotReplayPlugin : BasePlugin
     private int? _ownedUserId;
     private int _quotaBefore;
     private int? _quotaAfter;
+    private string _lastPlaybackStatus = "idle";
     private int _recordTicks;
     private const int MaxTicks = 64 * 120;
 
@@ -49,7 +51,7 @@ public class BotReplayPlugin : BasePlugin
         RegisterEventHandler<EventGrenadeThrown>(OnGrenadeThrown);
         AddCommand("css_botreplay_status", "Show bot replay readiness", (_, cmd) =>
         {
-            try { cmd.ReplyToCommand($"[BotReplay] MatchZy practice: {InPractice()}; native bridge: {BotController.RecordedTickCount(0) >= 0}; recording: {_recording.Count}; playing: {_playing.Count}; saved tracks: {_tracks.Count}."); }
+            try { cmd.ReplyToCommand($"[BotReplay] MatchZy practice: {InPractice()}; native bridge: {BotController.RecordedTickCount(0) >= 0}; recording: {_recording.Count}; playing: {_playing.Count}; saved tracks: {_tracks.Count}; playback: {_lastPlaybackStatus}."); }
             catch (Exception ex) { cmd.ReplyToCommand($"[BotReplay] Native bridge unavailable: {ex.Message}"); }
         });
         foreach (var command in new[] { "botrec", "botstop", "botplay", "botcancel" })
@@ -60,17 +62,19 @@ public class BotReplayPlugin : BasePlugin
 
     // MatchZy 0.9.2 publishes no mode capability. Read its active plugin instance and
     // fail closed if it is unavailable, unloaded, or its mode field changes.
-    private static bool InPractice()
+    private static object? MatchZy()
     {
         try
         {
             var manager = typeof(Application).GetField("_pluginManager", BindingFlags.Instance | BindingFlags.NonPublic)
                 ?.GetValue(Application.Instance) as IPluginManager;
-            var match = manager?.GetLoadedPlugins().SingleOrDefault(p => p.State == PluginState.Loaded && p.Plugin?.GetType().FullName == "MatchZy.MatchZy")?.Plugin;
-            return match?.GetType().GetField("isPractice", BindingFlags.Public | BindingFlags.Instance)?.GetValue(match) is true;
+            return manager?.GetLoadedPlugins().SingleOrDefault(p => p.State == PluginState.Loaded && p.Plugin?.GetType().FullName == "MatchZy.MatchZy")?.Plugin;
         }
-        catch { return false; }
+        catch { return null; }
     }
+    private static bool InPractice() { var match = MatchZy(); return match?.GetType().GetField("isPractice", BindingFlags.Public | BindingFlags.Instance)?.GetValue(match) is true; }
+    private static Dictionary<int, Dictionary<string, object>>? PracticeBots(object? match) =>
+        match?.GetType().GetField("pracUsedBots", BindingFlags.Public | BindingFlags.Instance)?.GetValue(match) as Dictionary<int, Dictionary<string, object>>;
 
     private HookResult OnChat(CCSPlayerController? player, CommandInfo info)
     {
@@ -114,7 +118,7 @@ public class BotReplayPlugin : BasePlugin
         if (!BotController.SetReplayPawn(p.Slot, pawn.Handle) || !BotController.StartRecord(p.Slot))
         { p.PrintToChat(" \x02[BotReplay] Could not start recording; check controller status."); return; }
         _recording.Add(p.Slot); _recordingSteamId = p.SteamID; _recordingPawn = pawn.Handle;
-        _tracks.Clear(); _map = Server.MapName; _recordTicks = 0;
+        _recordingMap = Server.MapName; _recordTicks = 0;
         p.PrintToChat(" \x04[BotReplay] Recording your movement. Use .botstop (maximum 120 seconds).");
     }
 
@@ -126,11 +130,19 @@ public class BotReplayPlugin : BasePlugin
         {
             BotController.StopRecord(slot);
             var (ticks, subs, commands) = BotController.GetRecordedMotionExtended(slot);
-            if (ticks.Length > 0 && ticks.Length == commands.Length)
+            // The native recorder can emit a negative subtick fraction (e.g. -1/64),
+            // while its replay loader requires each fraction to be in [0, 1).
+            bool validSubticks = subs.All(s => float.IsFinite(s.When));
+            if (validSubticks)
+                for (int i = 0; i < subs.Length; i++)
+                    subs[i].When = Math.Clamp(subs[i].When, 0f, MathF.BitDecrement(1f));
+            if (validSubticks && ticks.Length > 0 && ticks.Length == commands.Length)
                 tracks.Add(new Track(ticks, subs, commands, BotController.GetRecordedInputHistory(slot)));
         }
-        _recording.Clear(); _tracks = tracks;
-        var message = tracks.Count == 0 ? "[BotReplay] No movement was captured; check server log." : "[BotReplay] Your movement was recorded. Use .botplay to replay it on an enemy bot.";
+        _recording.Clear();
+        if (tracks.Count > 0) { _tracks = tracks; _map = _recordingMap; }
+        _recordingMap = null;
+        var message = tracks.Count == 0 ? "[BotReplay] No movement was captured; the previous recording was kept." : "[BotReplay] Your movement was recorded, replacing the previous recording. Use .botplay.";
         if (p != null) p.PrintToChat(" \x04" + message); else Server.PrintToChatAll(" \x04" + message);
     }
 
@@ -141,13 +153,21 @@ public class BotReplayPlugin : BasePlugin
         if (p.TeamNum is not (2 or 3)) { p.PrintToChat(" \x02[BotReplay] Join T or CT first."); return; }
         if (_beforeSpawn != null) { p.PrintToChat(" \x02[BotReplay] A replay bot is already being created."); return; }
         StopPlayback();
-        _beforeSpawn = Utilities.GetPlayers().Where(b => b.IsValid && b.IsBot).ToDictionary(b => b.Slot, b => b.Handle);
+        var match = MatchZy();
+        var tracked = PracticeBots(match);
+        var addBot = match?.GetType().GetMethod("AddBot", BindingFlags.Instance | BindingFlags.NonPublic, null,
+            new[] { typeof(CCSPlayerController), typeof(bool), typeof(bool) }, null);
+        if (tracked == null || addBot == null)
+        { p.PrintToChat(" \x02[BotReplay] MatchZy practice bot integration is unavailable."); return; }
+        _beforeSpawn = tracked.Keys.ToHashSet();
         _spawnTeam = p.TeamNum == 2 ? 3 : 2;
         _requesterSlot = p.Slot; _requesterSteamId = p.SteamID;
         _spawnTicks = 0; _spawnCancelled = false;
+        _lastPlaybackStatus = "waiting for MatchZy bot";
         _quotaBefore = ConVar.Find("bot_quota")?.GetPrimitiveValue<int>() ?? 0;
         _quotaAfter = null;
-        Server.ExecuteCommand(_spawnTeam == 2 ? "bot_add_t" : "bot_add_ct");
+        if (addBot.Invoke(match, new object?[] { p, false, false }) is not true)
+        { _beforeSpawn = null; p.PrintToChat(" \x02[BotReplay] MatchZy could not create a practice bot."); return; }
         p.PrintToChat(" \x04[BotReplay] Creating an enemy bot for playback...");
     }
 
@@ -156,8 +176,14 @@ public class BotReplayPlugin : BasePlugin
         if (_beforeSpawn == null) return;
         if (_ownedSlot < 0)
         {
-            var added = Utilities.GetPlayers().Where(b => b.IsValid && b.IsBot && !b.IsHLTV && b.UserId != null &&
-                (!_beforeSpawn.TryGetValue(b.Slot, out var handle) || handle != b.Handle)).ToList();
+            var tracked = PracticeBots(MatchZy());
+            if (tracked == null) { _spawnCancelled = true; }
+            var added = tracked?.Where(entry => !_beforeSpawn.Contains(entry.Key) &&
+                    entry.Value.TryGetValue("owner", out var owner) && owner is CCSPlayerController p &&
+                    p.IsValid && p.Slot == _requesterSlot && p.SteamID == _requesterSteamId &&
+                    entry.Value.TryGetValue("controller", out var value) && value is CCSPlayerController b &&
+                    b.IsValid && b.IsBot && !b.IsHLTV && b.TeamNum == _spawnTeam)
+                .Select(entry => (CCSPlayerController)entry.Value["controller"]).ToList() ?? new();
             if (added.Count > 1)
             {
                 NotifyRequester("Could not identify the new bot; replay cancelled.");
@@ -247,6 +273,7 @@ public class BotReplayPlugin : BasePlugin
 
     private void NotifyRequester(string message)
     {
+        _lastPlaybackStatus = message;
         var p = Utilities.GetPlayerFromSlot(_requesterSlot);
         if (p is { IsValid: true, IsBot: false } && p.SteamID == _requesterSteamId)
             p.PrintToChat(" \x04[BotReplay] " + message);
@@ -257,6 +284,10 @@ public class BotReplayPlugin : BasePlugin
         var bot = OwnedBot();
         _ownedSlot = -1; _ownedHandle = 0; _ownedUserId = null;
         if (bot == null) return;
+        var tracked = PracticeBots(MatchZy());
+        if (bot.UserId is int userId && tracked != null && tracked.TryGetValue(userId, out var entry) &&
+            entry.TryGetValue("controller", out var controller) && controller is CCSPlayerController recorded && recorded.Handle == bot.Handle)
+            tracked.Remove(userId);
         var quota = ConVar.Find("bot_quota");
         var current = quota?.GetPrimitiveValue<int>();
         bot.Disconnect(NetworkDisconnectionReason.NETWORK_DISCONNECT_KICKED);
@@ -299,5 +330,5 @@ public class BotReplayPlugin : BasePlugin
         foreach (int slot in _recording) BotController.StopRecord(slot);
         _recording.Clear(); StopPlayback();
     }
-    private void Reset() { try { StopAll(); } catch { _recording.Clear(); _playing.Clear(); } _tracks.Clear(); _map = null; }
+    private void Reset() { try { StopAll(); } catch { _recording.Clear(); _playing.Clear(); } _tracks.Clear(); _map = null; _recordingMap = null; }
 }

@@ -11,9 +11,9 @@ Join T or CT and enter MatchZy practice with `.prac`. These commands require the
 - `.botplay` spawns an enemy bot and replays the recording from your recorded position, including grenade throws. The bot is removed after playback or cancellation.
 - `.botcancel` stops recording or playback.
 
-Recordings are held in memory for the current map, up to two minutes. They are lost when the map changes, the plugin reloads or the server restarts. A new recording replaces the previous one. Recording ends if the player dies or disconnects. The bot receives the recorded grenade types and replays recorded weapon switches and throw inputs. Carry limits or changed surroundings may affect grenade playback. Fights and other interactions may also change the outcome.
+Recordings are held in memory for the current map, up to two minutes. They are lost when the map changes, the plugin reloads or the server restarts. A completed recording replaces the previous one; cancelling or capturing no input keeps the previous recording. Recording ends if the player dies or disconnects. The bot receives the recorded grenade types and replays recorded weapon switches and throw inputs. Carry limits or changed surroundings may affect grenade playback. Fights and other interactions may also change the outcome.
 
-The plugin reads the loaded MatchZy instance's practice flag. It refuses commands and stops active recording or replay when practice ends. If the MatchZy instance or its practice flag cannot be found, it fails closed. This is based on MatchZy 0.9.x's `isPractice` field and may need updating if MatchZy changes its internals.
+The plugin reads the loaded MatchZy instance's practice flag and requests its practice bot through MatchZy's own bot manager. It refuses commands and stops active recording or replay when practice ends. If the needed MatchZy state is unavailable, it fails closed. This uses MatchZy 0.9.x internals and may need updating if they change.
 
 ## Install
 
@@ -27,7 +27,7 @@ Needs the .NET 10 SDK, `curl`, `unzip`, Python 3, and `sha256sum`:
 
 ```sh
 dotnet build -c Release -o dist
-./package.sh v1.2.0
+./package.sh v1.3.0
 ```
 
 The packaging script downloads the pinned BotController Linux release, checks its checksum, and creates an installable ZIP under `dist/`. The plugin and native controller are distributed together so their ABI stays matched. The source copied under `vendor/` comes from [CS2-Bot-Controller v0.9.0](https://github.com/XBribo/CS2-Bot-Controller/tree/v0.9.0); the complete corresponding source for the native binary is available there.
