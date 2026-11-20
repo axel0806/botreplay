@@ -12,15 +12,17 @@ namespace BotReplay;
 public class BotReplayPlugin : BasePlugin
 {
     public override string ModuleName => "BotReplay";
-    public override string ModuleVersion => "1.0.0";
+    public override string ModuleVersion => "1.1.0";
     public override string ModuleAuthor => "local";
-    public override string ModuleDescription => "Record and replay enemy bots in MatchZy practice.";
+    public override string ModuleDescription => "Record your movement and replay it with an enemy bot in MatchZy practice.";
 
     private sealed record Track(ReplayTick[] Ticks, SubtickMove[] Subticks, ReplayCommandFrame[] Commands, byte[] History);
     private readonly List<int> _recording = new();
     private readonly HashSet<int> _playing = new();
     private List<Track> _tracks = new();
     private string? _map;
+    private ulong _recordingSteamId;
+    private nint _recordingPawn;
     private int _recordTicks;
     private const int MaxTicks = 64 * 120;
 
@@ -33,7 +35,7 @@ public class BotReplayPlugin : BasePlugin
         RegisterListener<Listeners.OnMapEnd>(Reset);
         AddCommand("css_botreplay_status", "Show bot replay readiness", (_, cmd) =>
         {
-            try { cmd.ReplyToCommand($"[BotReplay] MatchZy practice: {InPractice()}; native bridge: {BotController.RecordedTickCount(0) >= 0}; recording: {_recording.Count}; playing: {_playing.Count}; saved tracks: {_tracks.Count}; bot ticks: {string.Join(",", Utilities.GetPlayers().Where(p => p.IsValid && p.IsBot && p.TeamNum is 2 or 3).Select(p => $"{p.Slot}={BotController.RecordedTickCount(p.Slot)}"))}."); }
+            try { cmd.ReplyToCommand($"[BotReplay] MatchZy practice: {InPractice()}; native bridge: {BotController.RecordedTickCount(0) >= 0}; recording: {_recording.Count}; playing: {_playing.Count}; saved tracks: {_tracks.Count}."); }
             catch (Exception ex) { cmd.ReplyToCommand($"[BotReplay] Native bridge unavailable: {ex.Message}"); }
         });
         foreach (var command in new[] { "botrec", "botstop", "botplay", "botcancel" })
@@ -96,15 +98,15 @@ public class BotReplayPlugin : BasePlugin
     {
         if (p.TeamNum is not (2 or 3)) { p.PrintToChat(" \x02[BotReplay] Join T or CT first."); return; }
         if (_recording.Count > 0) { p.PrintToChat(" \x02[BotReplay] Already recording. Use .botstop."); return; }
+        if (p.PlayerPawn is not { IsValid: true, Value.IsValid: true } || p.PlayerPawn.Value!.LifeState != 0)
+        { p.PrintToChat(" \x02[BotReplay] You must be alive to record your movement."); return; }
         StopPlayback();
-        var bots = Enemies(p);
-        if (bots.Count == 0) { p.PrintToChat(" \x02[BotReplay] No living enemy bots found."); return; }
-        foreach (var b in bots)
-            if (BotController.SetReplayPawn(b.Slot, b.PlayerPawn.Value!.Handle) && BotController.StartRecord(b.Slot))
-                _recording.Add(b.Slot);
-        if (_recording.Count == 0) { p.PrintToChat(" \x02[BotReplay] Could not start recording; check controller status."); return; }
+        var pawn = p.PlayerPawn.Value!;
+        if (!BotController.SetReplayPawn(p.Slot, pawn.Handle) || !BotController.StartRecord(p.Slot))
+        { p.PrintToChat(" \x02[BotReplay] Could not start recording; check controller status."); return; }
+        _recording.Add(p.Slot); _recordingSteamId = p.SteamID; _recordingPawn = pawn.Handle;
         _tracks.Clear(); _map = Server.MapName; _recordTicks = 0;
-        p.PrintToChat($" \x04[BotReplay] Recording {_recording.Count}/{bots.Count} enemy bots. Use .botstop (maximum 120 seconds).");
+        p.PrintToChat(" \x04[BotReplay] Recording your movement. Use .botstop (maximum 120 seconds).");
     }
 
     private void StopRecording(CCSPlayerController? p)
@@ -119,7 +121,7 @@ public class BotReplayPlugin : BasePlugin
                 tracks.Add(new Track(ticks, subs, commands, BotController.GetRecordedInputHistory(slot)));
         }
         _recording.Clear(); _tracks = tracks;
-        var message = $"[BotReplay] Captured {tracks.Count} bot tracks in memory." + (tracks.Count == 0 ? " No bot input was captured; see server log." : " Use .botplay.");
+        var message = tracks.Count == 0 ? "[BotReplay] No movement was captured; check server log." : "[BotReplay] Your movement was recorded. Use .botplay to replay it on an enemy bot.";
         if (p != null) p.PrintToChat(" \x04" + message); else Server.PrintToChatAll(" \x04" + message);
     }
 
@@ -150,7 +152,15 @@ public class BotReplayPlugin : BasePlugin
         {
             if (!InPractice()) { StopAll(); return; }
             _playing.RemoveWhere(slot => !BotController.IsReplaying(slot));
-            if (_recording.Count > 0 && ++_recordTicks >= MaxTicks) StopRecording(null);
+            if (_recording.Count > 0)
+            {
+                var source = Utilities.GetPlayerFromSlot(_recording[0]);
+                if (source is not { IsValid: true, IsBot: false } || source.SteamID != _recordingSteamId ||
+                    source.PlayerPawn is not { IsValid: true, Value.IsValid: true } ||
+                    source.PlayerPawn.Value!.Handle != _recordingPawn || source.PlayerPawn.Value.LifeState != 0 ||
+                    ++_recordTicks >= MaxTicks)
+                    StopRecording(null);
+            }
         }
         catch (Exception ex) { Server.PrintToConsole($"[BotReplay] Tick error: {ex.Message}"); StopAll(); }
     }
