@@ -6,13 +6,15 @@ using CounterStrikeSharp.API.Core.Plugin;
 using CounterStrikeSharp.API.Core.Plugin.Host;
 using CounterStrikeSharp.API.Modules.Admin;
 using CounterStrikeSharp.API.Modules.Commands;
+using CounterStrikeSharp.API.Modules.Cvars;
+using CounterStrikeSharp.API.ValveConstants.Protobuf;
 
 namespace BotReplay;
 
 public class BotReplayPlugin : BasePlugin
 {
     public override string ModuleName => "BotReplay";
-    public override string ModuleVersion => "1.1.0";
+    public override string ModuleVersion => "1.2.0";
     public override string ModuleAuthor => "local";
     public override string ModuleDescription => "Record your movement and replay it with an enemy bot in MatchZy practice.";
 
@@ -23,6 +25,17 @@ public class BotReplayPlugin : BasePlugin
     private string? _map;
     private ulong _recordingSteamId;
     private nint _recordingPawn;
+    private Dictionary<int, nint>? _beforeSpawn;
+    private int _spawnTeam;
+    private int _spawnTicks;
+    private int _requesterSlot;
+    private ulong _requesterSteamId;
+    private bool _spawnCancelled;
+    private int _ownedSlot = -1;
+    private nint _ownedHandle;
+    private int? _ownedUserId;
+    private int _quotaBefore;
+    private int? _quotaAfter;
     private int _recordTicks;
     private const int MaxTicks = 64 * 120;
 
@@ -33,6 +46,7 @@ public class BotReplayPlugin : BasePlugin
         RegisterListener<Listeners.OnTick>(OnTick);
         RegisterListener<Listeners.OnMapStart>(_ => Reset());
         RegisterListener<Listeners.OnMapEnd>(Reset);
+        RegisterEventHandler<EventGrenadeThrown>(OnGrenadeThrown);
         AddCommand("css_botreplay_status", "Show bot replay readiness", (_, cmd) =>
         {
             try { cmd.ReplyToCommand($"[BotReplay] MatchZy practice: {InPractice()}; native bridge: {BotController.RecordedTickCount(0) >= 0}; recording: {_recording.Count}; playing: {_playing.Count}; saved tracks: {_tracks.Count}."); }
@@ -89,11 +103,6 @@ public class BotReplayPlugin : BasePlugin
         }
     }
 
-    private static List<CCSPlayerController> Enemies(CCSPlayerController p) =>
-        Utilities.GetPlayers().Where(b => b.IsValid && b.IsBot && b.TeamNum is 2 or 3 && b.TeamNum != p.TeamNum &&
-            b.PlayerPawn is { IsValid: true, Value.IsValid: true } && b.PlayerPawn.Value!.LifeState == 0)
-            .OrderBy(b => b.Slot).ToList();
-
     private void Record(CCSPlayerController p)
     {
         if (p.TeamNum is not (2 or 3)) { p.PrintToChat(" \x02[BotReplay] Join T or CT first."); return; }
@@ -130,28 +139,141 @@ public class BotReplayPlugin : BasePlugin
         if (_recording.Count > 0) { p.PrintToChat(" \x02[BotReplay] Stop recording first with .botstop."); return; }
         if (_tracks.Count == 0 || _map != Server.MapName) { p.PrintToChat(" \x02[BotReplay] No recording for this map."); return; }
         if (p.TeamNum is not (2 or 3)) { p.PrintToChat(" \x02[BotReplay] Join T or CT first."); return; }
-        var bots = Enemies(p);
-        if (bots.Count < _tracks.Count) { p.PrintToChat($" \x02[BotReplay] Need {_tracks.Count} living enemy bots; found {bots.Count}."); return; }
+        if (_beforeSpawn != null) { p.PrintToChat(" \x02[BotReplay] A replay bot is already being created."); return; }
         StopPlayback();
-        for (int i = 0; i < _tracks.Count; i++)
+        _beforeSpawn = Utilities.GetPlayers().Where(b => b.IsValid && b.IsBot).ToDictionary(b => b.Slot, b => b.Handle);
+        _spawnTeam = p.TeamNum == 2 ? 3 : 2;
+        _requesterSlot = p.Slot; _requesterSteamId = p.SteamID;
+        _spawnTicks = 0; _spawnCancelled = false;
+        _quotaBefore = ConVar.Find("bot_quota")?.GetPrimitiveValue<int>() ?? 0;
+        _quotaAfter = null;
+        Server.ExecuteCommand(_spawnTeam == 2 ? "bot_add_t" : "bot_add_ct");
+        p.PrintToChat(" \x04[BotReplay] Creating an enemy bot for playback...");
+    }
+
+    private void UpdateSpawn()
+    {
+        if (_beforeSpawn == null) return;
+        if (_ownedSlot < 0)
         {
-            var bot = bots[i]; var t = _tracks[i];
-            if (!BotController.SetReplayPawn(bot.Slot, bot.PlayerPawn.Value!.Handle) ||
-                !BotController.LoadReplay(bot.Slot, t.Ticks, t.Subticks, t.Commands, t.History) ||
-                !BotController.StartReplay(bot.Slot))
-            { StopPlayback(); p.PrintToChat(" \x02[BotReplay] Could not start every bot; playback stopped."); return; }
-            _playing.Add(bot.Slot);
+            var added = Utilities.GetPlayers().Where(b => b.IsValid && b.IsBot && !b.IsHLTV && b.UserId != null &&
+                (!_beforeSpawn.TryGetValue(b.Slot, out var handle) || handle != b.Handle)).ToList();
+            if (added.Count > 1)
+            {
+                NotifyRequester("Could not identify the new bot; replay cancelled.");
+                _beforeSpawn = null; return;
+            }
+            if (added.Count == 1)
+            {
+                var bot = added[0]; _ownedSlot = bot.Slot; _ownedHandle = bot.Handle; _ownedUserId = bot.UserId;
+                _quotaAfter = ConVar.Find("bot_quota")?.GetPrimitiveValue<int>();
+            }
         }
-        p.PrintToChat($" \x04[BotReplay] Playing {_playing.Count} tracks. Use .botcancel to stop.");
+        if (_ownedSlot >= 0)
+        {
+            var bot = OwnedBot();
+            if (bot == null) { _beforeSpawn = null; _ownedSlot = -1; NotifyRequester("Replay bot disconnected."); return; }
+            if (_spawnCancelled || !InPractice()) { _beforeSpawn = null; RemoveOwnedBot(); return; }
+            if (bot.TeamNum == _spawnTeam && _spawnTicks == 64 &&
+                (bot.PlayerPawn is not { IsValid: true, Value.IsValid: true } || bot.PlayerPawn.Value!.LifeState != 0))
+                bot.Respawn();
+            if (bot.TeamNum == _spawnTeam && bot.PlayerPawn is { IsValid: true, Value.IsValid: true } && bot.PlayerPawn.Value!.LifeState == 0)
+            {
+                _beforeSpawn = null;
+                var t = _tracks[0];
+                var missing = PrepareGrenades(bot, t);
+                if (!BotController.SetReplayPawn(bot.Slot, bot.PlayerPawn.Value.Handle) ||
+                    !BotController.LoadReplay(bot.Slot, t.Ticks, t.Subticks, t.Commands, t.History) ||
+                    !BotController.StartReplay(bot.Slot))
+                { RemoveOwnedBot(); NotifyRequester("Could not start playback."); return; }
+                _playing.Add(bot.Slot);
+                NotifyRequester("Playing your recording on a new enemy bot. Use .botcancel to stop.");
+                if (missing > 0) NotifyRequester("Could not equip every recorded grenade; check grenade carry limits.");
+                return;
+            }
+        }
+        if (++_spawnTicks >= 64 * 8)
+        {
+            _beforeSpawn = null; RemoveOwnedBot();
+            if (!_spawnCancelled) NotifyRequester("Could not spawn a living enemy bot. Check server slots and team limits.");
+        }
+    }
+
+    private static string? GrenadeForDef(int def, int team) => def switch
+    {
+        43 => "weapon_flashbang", 44 => "weapon_hegrenade", 45 => "weapon_smokegrenade",
+        46 or 48 => team == 3 ? "weapon_incgrenade" : "weapon_molotov", 47 => "weapon_decoy", _ => null
+    };
+
+    private static bool HasWeapon(CCSPlayerController bot, string name)
+    {
+        var weapons = bot.PlayerPawn.Value?.WeaponServices?.MyWeapons;
+        return weapons != null && weapons.Any(w => w.IsValid && w.Value is { IsValid: true } weapon && weapon.DesignerName == name);
+    }
+
+    private static int PrepareGrenades(CCSPlayerController bot, Track track)
+    {
+        int missing = 0;
+        foreach (var name in track.Ticks.Select(t => GrenadeForDef(t.WeaponDefIndex, bot.TeamNum)).OfType<string>().Distinct())
+            if (!HasWeapon(bot, name) && bot.GiveNamedItem(name) == nint.Zero) missing++;
+        return missing;
+    }
+
+    // The native replay reproduces recorded attack and weapon-switch input. If the
+    // server consumes grenades, replenish after a throw so later throws can replay.
+    private HookResult OnGrenadeThrown(EventGrenadeThrown e, GameEventInfo info)
+    {
+        var bot = e.Userid;
+        if (bot is not { IsValid: true, IsBot: true } || bot.Slot != _ownedSlot || bot.Handle != _ownedHandle ||
+            !_playing.Contains(bot.Slot) || !InPractice()) return HookResult.Continue;
+        var name = e.Weapon.StartsWith("weapon_", StringComparison.Ordinal) ? e.Weapon : "weapon_" + e.Weapon;
+        if (name is not ("weapon_flashbang" or "weapon_hegrenade" or "weapon_smokegrenade" or "weapon_molotov" or "weapon_incgrenade" or "weapon_decoy"))
+            return HookResult.Continue;
+        var slot = bot.Slot; var handle = bot.Handle;
+        AddTimer(0.1f, () =>
+        {
+            var current = OwnedBot();
+            if (!InPractice() || current == null || current.Slot != slot || current.Handle != handle || !_playing.Contains(slot) || !BotController.IsReplaying(slot)) return;
+            if (!HasWeapon(current, name)) current.GiveNamedItem(name);
+        });
+        return HookResult.Continue;
+    }
+
+    private CCSPlayerController? OwnedBot()
+    {
+        var bot = _ownedSlot < 0 ? null : Utilities.GetPlayerFromSlot(_ownedSlot);
+        return bot is { IsValid: true, IsBot: true } && bot.Handle == _ownedHandle && bot.UserId == _ownedUserId ? bot : null;
+    }
+
+    private void NotifyRequester(string message)
+    {
+        var p = Utilities.GetPlayerFromSlot(_requesterSlot);
+        if (p is { IsValid: true, IsBot: false } && p.SteamID == _requesterSteamId)
+            p.PrintToChat(" \x04[BotReplay] " + message);
+    }
+
+    private void RemoveOwnedBot()
+    {
+        var bot = OwnedBot();
+        _ownedSlot = -1; _ownedHandle = 0; _ownedUserId = null;
+        if (bot == null) return;
+        var quota = ConVar.Find("bot_quota");
+        var current = quota?.GetPrimitiveValue<int>();
+        bot.Disconnect(NetworkDisconnectionReason.NETWORK_DISCONNECT_KICKED);
+        if (_quotaAfter is int after && current == after && after > _quotaBefore)
+            quota!.SetValue(Math.Max(0, after - 1));
+        _quotaAfter = null;
     }
 
     private void OnTick()
     {
-        if (_recording.Count == 0 && _playing.Count == 0) return;
+        if (_recording.Count == 0 && _playing.Count == 0 && _beforeSpawn == null) return;
         try
         {
-            if (!InPractice()) { StopAll(); return; }
-            _playing.RemoveWhere(slot => !BotController.IsReplaying(slot));
+            if (!InPractice()) { StopAll(); UpdateSpawn(); return; }
+            UpdateSpawn();
+            if (_playing.Count > 0 && (_ownedSlot < 0 || OwnedBot() == null || !BotController.IsReplaying(_ownedSlot)))
+                StopPlayback();
             if (_recording.Count > 0)
             {
                 var source = Utilities.GetPlayerFromSlot(_recording[0]);
@@ -169,6 +291,8 @@ public class BotReplayPlugin : BasePlugin
     {
         foreach (int slot in _playing) BotController.StopReplay(slot);
         _playing.Clear();
+        if (_beforeSpawn != null) _spawnCancelled = true;
+        else RemoveOwnedBot();
     }
     private void StopAll()
     {
